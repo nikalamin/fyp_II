@@ -1,0 +1,2876 @@
+# Rainfall Pattern and Flood Analysis – Hulu Langat 2021
+
+This repository contains R scripts used in my undergraduate thesis at
+Universiti Kebangsaan Malaysia (UKM).
+
+## Methods
+- Mann-Kendall trend test
+- Sen’s slope estimator
+- Pettitt change point test
+- Rainfall Anomaly Index (RAI)
+- SARIMAX
+- XGBoost
+
+## Notes
+- Raw rainfall data from JPS is not shared due to data ownership.
+- Scripts are provided for reproducibility and educational purposes.
+
+# FYP Kod R
+
+
+library(moments)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(imputeTS)
+library(nortest)
+
+all_rfs <- dplyr::bind_rows(rfs1, rfs5, rfs7, rfs9) %>%
+  arrange(Stesen, Tarikh)
+View(all_rfs)
+
+all_rfs <- all_rfs %>%
+  filter(!(month(Tarikh) == 2 & mday(Tarikh) == 29))
+
+ggplot(all_rfs, aes(x = Tarikh, y = Hujan)) +
+  geom_line(color="blue4",na.rm = TRUE) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Hujan Mengikut Stesen",
+       x = "Tarikh", y = "Hujan (mm)", color = "Stesen") +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+data_flood <- all_rfs %>%
+  filter(Tarikh >= as.Date("2021-12-17") &
+           Tarikh <= as.Date("2021-12-22"))
+View(data_flood)
+
+plotbanjir <- ggplot(data_flood, aes(x = Tarikh, y = Hujan)) +
+  geom_line(color="blue4",na.rm = TRUE) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "fixed") +
+  labs(title = "Hujan Mengikut Stesen semasa Banjir Disember 2021",
+       x = "Tarikh", y = "Hujan (mm)", color = "Stesen") +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+ggsave("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\DRAFT 0711\\rajah\\plotbanjir.png", plotbanjir, width = 12, height = 8, dpi = 480)
+
+
+#Plot setiap Stesen
+
+ggplot(rfs1, aes(x = Tarikh, y = Hujan)) +
+  geom_line(color="blue4",na.rm = TRUE) +
+  labs(title = "Hujan Stesen 0240821RF Balai Polis Batu 14",
+       x = "Tarikh", y = "Hujan (mm)", color = "Stesen") +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+dec_rfs <- all_rfs %>%
+  filter(month(Tarikh) == 12 & year(Tarikh) == 2021)
+
+ggplot(dec_rfs, aes(x = Tarikh, y = Hujan)) +
+  geom_line(color = "dodgerblue4", na.rm = TRUE) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Hujan Disember 2021 Mengikut Stesen",
+       x = "Tarikh", y = "Hujan (mm)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+ggplot(dec_rfs, aes(x = Tarikh, y = Hujan, color = Stesen)) +
+  geom_line(na.rm = TRUE, linewidth = 0.8) +
+  labs(title = "Perbandingan Hujan Disember 2021 di Semua Stesen",
+       x = "Tarikh", y = "Hujan (mm)", color = "Stesen") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Ganti NA dengan purata harian
+
+dailyaverage <- function(df, date_col = "Tarikh", value_col = "Hujan", group_col = "Stesen") {
+  stopifnot(all(c(date_col, value_col, group_col) %in% names(df)))
+  x <- df %>%
+    mutate(
+      !!date_col := as.Date(.data[[date_col]]),
+      !!value_col := as.numeric(.data[[value_col]]),
+      !!value_col := ifelse(is.nan(.data[[value_col]]), NA_real_, .data[[value_col]]),
+      .Year = year(.data[[date_col]]),
+      .MD   = format(.data[[date_col]], "%m-%d")
+    )
+  
+  station_mean <- x %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(.StationMean = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop")
+
+  md_totals <- x %>%
+    group_by(.data[[group_col]], .MD) %>%
+    summarise(
+      .total_sum = sum(.data[[value_col]], na.rm = TRUE),
+      .total_n   = sum(!is.na(.data[[value_col]])),
+      .groups = "drop"
+    )
+  
+  md_by_year <- x %>%
+    group_by(.data[[group_col]], .MD, .Year) %>%
+    summarise(
+      .year_sum = sum(.data[[value_col]], na.rm = TRUE),
+      .year_n   = sum(!is.na(.data[[value_col]])),
+      .groups = "drop"
+    )
+  
+  md_excl_year <- md_by_year %>%
+    left_join(md_totals, by = c(group_col, ".MD")) %>%
+    mutate(
+      .other_n   = pmax(.total_n - .year_n, 0L),
+      .other_sum = .total_sum - .year_sum,
+      .MDMean_exclYear = ifelse(.other_n > 0, .other_sum / .other_n, NA_real_)
+    ) %>%
+    select(all_of(group_col), .MD, .Year, .MDMean_exclYear)
+  
+  x_imp <- x %>%
+    left_join(md_excl_year, by = setdiff(c(group_col, ".MD", ".Year"), character(0))) %>%
+    left_join(station_mean, by = group_col) %>%
+    mutate(
+      .Hujan_imp = ifelse(is.na(.data[[value_col]]), coalesce(.MDMean_exclYear, .StationMean), .data[[value_col]])
+    ) %>%
+    transmute(
+      !!!rlang::syms(setdiff(names(df), character(0))),   # kekalkan kolum asal
+      Hujan_imp = .Hujan_imp
+    )
+  
+  x_imp
+}
+
+
+# Gabung all stesen
+
+rfs_all <- dplyr::bind_rows(rfs1, rfs5, rfs7, rfs9)
+View(rfs_all)
+rfs_all$Tarikh <- as.Date(rfs_all$Tarikh)
+
+all_rfs <- dailyaverage(
+  df = all_rfs,
+  date_col = "Tarikh",
+  value_col = "Hujan",
+  group_col = "Stesen"
+)
+
+
+before_na <- sum(is.na(all_rfs$Hujan))
+after_na  <- sum(is.na(all_rfs$Hujan_imp))
+cat("NA sebelum:", before_na, " | NA selepas (pada Hujan_imp):", after_na, "\n")
+
+all_rfs <- all_rfs %>%
+  mutate(Year = lubridate::year(Tarikh))
+
+View(all_rfs)
+
+# Plot 4 Stesen
+
+ggplot(all_rfs, aes(x = Tarikh, y = Hujan_imp)) +
+  geom_line(color="navy",na.rm = TRUE) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Hujan Harian Mengikut Stesen",
+       x = "Tarikh", y = "Hujan (mm)", color = "Stesen") +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.1),
+    strip.text = element_text(size = 13, face = "bold")
+  )
+
+
+fyp2<-all_rfs
+write.csv(fyp2, "datafyp2.csv", row.names = FALSE)
+
+
+fyp2 <- fyp2 %>%
+  mutate(
+    Tarikh = as.Date(Tarikh),
+    Tahun = year(Tarikh),
+    Bulan = month(Tarikh, label = TRUE, abbr = FALSE),
+    Hari = day(Tarikh)
+  )
+glimpse(fyp2)
+
+fyp2 %>% group_by(Stesen) %>%
+  summarise(
+    Jumlah_Data = n(),
+    Bilangan_NA = sum(is.na(Hujan)),
+    Bil_Hari_Hujan = sum(Hujan > 0, na.rm = TRUE),
+    Min = mean(Hujan, na.rm = TRUE),
+    Max = max(Hujan, na.rm = TRUE),
+    Median = median(Hujan, na.rm = TRUE),
+    SD = sd(Hujan, na.rm = TRUE),
+    Kurtosis = kurtosis(Hujan, na.rm = TRUE),
+    Skewness = skewness(Hujan, na.rm = TRUE)
+  )
+
+# Ujian Normaliti Anderson Darling
+
+hasil_normaliti_ad <- fyp2 %>%
+  group_by(Stesen) %>%
+  summarise(
+    ad_statistic = ad.test(Hujan_imp)$statistic,
+    ad_p_value = ad.test(Hujan_imp)$p.value
+  )
+hasil_normaliti_ad
+
+
+#Average Bulanan & Total Bulanan
+
+line_fyp2 <- fyp2 %>%
+  mutate(
+    Tarikh    = as.Date(Tarikh),
+    Hujan_use = dplyr::coalesce(Hujan_imp, Hujan),
+    Tahun     = year(Tarikh),
+    BulanNum  = month(Tarikh),
+    BulanLab  = factor(month(Tarikh, label = TRUE, abbr = TRUE),
+                       levels = month.abb)  # susunan Jan..Dec
+  )
+
+avg_bulanan <- line_fyp2 %>%
+  group_by(Stesen, BulanLab) %>%
+  summarise(Avg_mm = mean(Hujan_use, na.rm = TRUE), .groups = "drop")
+
+ggplot(avg_bulanan, aes(BulanLab, Avg_mm, group = 1)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Purata Hujan Bulanan (Merentas Tahun) — Setiap Stesen",
+       x = "Bulan", y = "Purata Hujan Harian (mm)") +
+  theme_minimal()
+
+
+sum_bulanan_tahun <- line_fyp2 %>%
+  group_by(Stesen, Tahun, BulanLab) %>%
+  summarise(Total_bulan = sum(Hujan_use, na.rm = TRUE), .groups = "drop")
+
+avg_total_bulanan <- sum_bulanan_tahun %>%
+  group_by(Stesen, BulanLab) %>%
+  summarise(Avg_total_mm = mean(Total_bulan, na.rm = TRUE), .groups = "drop")
+
+ggplot(avg_total_bulanan, aes(BulanLab, Avg_total_mm, group = 1)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Purata Jumlah Hujan Bulanan (Merentas Tahun) — Setiap Stesen",
+       x = "Bulan", y = "Purata Jumlah Bulanan (mm)") +
+  theme_minimal()
+
+data <- read.csv("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\final data.csv")
+data %>% group_by(Stesen) %>%
+  summarise(
+    Jumlah_Data = n(),
+    Jumlah_NA = sum(is.na(Hujan)),
+    Min = mean(Hujan, na.rm = TRUE),
+    Max = max(Hujan, na.rm = TRUE),
+    Median = median(Hujan, na.rm = TRUE),
+    SD = sd(Hujan, na.rm = TRUE),
+    Kurtosis = kurtosis(Hujan, na.rm = TRUE)
+  )
+
+hasil_normaliti_ad <- data %>%
+  group_by(Stesen) %>%
+  summarise(
+    ad_statistic = ad.test(Hujan_imp)$statistic,
+    ad_p_value = ad.test(Hujan_imp)$p.value
+  )
+
+print(hasil_normaliti_ad)
+
+
+# OBJEKTIF 1
+
+library(dplyr)
+library(tidyverse)
+library(lubridate)    
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(scales)
+library(stringr)
+library(trend)
+library(Kendall)
+library(changepoint)  
+library(strucchange)  
+library(randtests)
+
+barobj1<-ggplot(df_harian, aes(x = Stesen, y = Hujan_imp, fill = Stesen)) +
+  geom_boxplot(width = 0.6, outlier.size = 1.8, outlier.alpha = 0.8, colour = "black") +
+  scale_fill_viridis_d(option = "C") +   # palet viridis diskret
+  scale_y_continuous(labels = label_number(big.mark = ",")) +
+  labs(
+    title = "Taburan Hujan Harian Mengikut Stesen (2010–2024)",
+    x = "Stesen Cerapan Hujan",
+    y = "Jumlah Hujan Harian (mm)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 20, hjust = 1, size = 12),
+    axis.title.x = element_text(hjust = 0.5, size = 12, face = "bold"),                   
+    axis.title.y = element_text(hjust = 0.5, size = 12, face = "bold"),
+    legend.position = "none"
+  )
+
+df_bulanan <- df_harian %>%
+  group_by(Stesen, year, month) %>%
+  summarise(
+    hujan_sum = sum(Hujan_imp, na.rm = TRUE), 
+    Avg_Temp = mean(temp, na.rm = TRUE),
+    Avg_Humidity = mean(humidity, na.rm = TRUE),
+    Sum_Precip = sum(precip, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(date = as.Date(paste(year, month, 1, sep = "-")))
+
+
+#ANALISIS AWAL
+
+mk_tahun <- df_bulanan %>%
+  mutate(Tarikh = as.Date(date)) %>%
+  mutate(Tahun = format(Tarikh, "%Y")) %>%
+  group_by(Stesen, Tahun) %>%
+  summarise(Jumlah_Hujan_Tahunan = sum(hujan_sum, na.rm = TRUE), .groups = 'drop') %>%
+  pivot_wider(names_from = Stesen, values_from = Jumlah_Hujan_Tahunan) %>%
+  mutate(Tahun = as.numeric(Tahun))
+
+stesen_kolum <- names(mk_tahun)[-1] 
+run_mk_sen <- function(siri_masa) {
+  hasil_mk <- mk.test(siri_masa)
+  hasil_sen <- sens.slope(siri_masa)
+  p_value <- hasil_mk$p.value
+  z_score <- hasil_mk$statistic
+  sen_slope <- hasil_sen$estimates
+  mk_trend <- ifelse(z_score > 0, "Increasing", "Decreasing")
+  test_interpretation <- ifelse(p_value <= 0.05, "There is a trend", "No trend")
+  
+  data.frame(
+    "p-value" = round(p_value, 5),
+    "Z" = round(z_score, 4),
+    "MK_Trend" = mk_trend,
+    "Sen_Slope_Q" = round(sen_slope, 4),
+    "Test_Interpretation" = test_interpretation
+  )
+}
+
+hasil_semua_stesen <- lapply(mk_tahun[, stesen_kolum], run_mk_sen)
+
+df_hasil_akhir <- bind_rows(hasil_semua_stesen, .id = "Stesen")
+print(df_hasil_akhir)
+
+head(df_bulanan)
+df_nested_bulan <- df_bulanan %>%
+  group_by(Stesen, month) %>%
+  nest()
+df_hasil_trend_bulan <- df_nested_bulan %>%
+  mutate(hasil_ujian = map(data, ~ run_mk_sen(.$hujan_sum))) %>%
+  unnest(hasil_ujian) %>%
+  mutate(Bulan = month.abb[as.numeric(month)]) %>%
+  select(Stesen, Bulan, p.value, Z, MK_Trend, Sen_Slope_Q, Test_Interpretation) %>%
+  arrange(Stesen, month) 
+
+print("\n--- JADUAL HASIL UJIAN TREND BULANAN (SEMUA BULAN) ---")
+(df_hasil_trend_bulan)
+
+ggplot(df_bulanan, aes(x = date, y = hujan_sum)) +
+  geom_line(color = "dodgerblue4", na.rm = TRUE) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", size = 1, color="red2") +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(title = "Hujan Disember 2021 Mengikut Stesen",
+       x = "Tarikh", y = "Hujan (mm)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+data_intercept_fixed <- df_bulanan %>%
+  mutate(Tahun = as.numeric(format(date, "%Y"))) %>%
+  rename(Hujan = hujan_sum) %>%
+  group_by(Stesen) %>%
+  summarise(
+    Avg_Hujan = mean(Hujan, na.rm = TRUE),
+    Avg_Tahun = mean(Tahun, na.rm = TRUE)
+  )
+
+print(head(data_intercept_fixed))
+
+df_gabung_fixed <- df_hasil_akhir %>%
+  select(Stesen, Sen_Slope_Q, Test_Interpretation) %>%
+  left_join(data_intercept_fixed, by = "Stesen") %>%
+  mutate(Intercept = Avg_Hujan - (Sen_Slope_Q * Avg_Tahun))
+
+df_plot_bulan <- df_bulanan %>%
+  mutate(
+    Tahun = as.numeric(format(date, "%Y")),
+    Bulan = as.numeric(format(date, "%m")),
+    Decimal_Date = Tahun + (Bulan - 0.5) / 12,
+    Hujan = hujan_sum 
+  ) %>%
+  drop_na(Hujan) %>%
+  left_join(df_gabung_fixed, by = "Stesen")
+
+stesen_kolum_fixed <- unique(df_plot_bulan$Stesen)
+plot_stesen_bulan <- function(stesen_nama, data_plot) {
+  df_stesen <- filter(data_plot, Stesen == stesen_nama)
+  sen_slope_q <- round(df_stesen$Sen_Slope_Q[1], 2)
+  trend_interp <- df_stesen$Test_Interpretation[1]
+  
+  p <- ggplot(df_stesen, aes(x = Decimal_Date, y = Hujan)) +
+    geom_line(color = "blue4", alpha = 0.9, linewidth = 0.8) +
+    aes(
+      intercept = Intercept,
+      slope = Sen_Slope_Q,
+      color = "Kecerunan Sen"           
+    ),
+  linewidth = 1,
+  linetype = "dashed"
+  ) +
+  labs(
+    title = paste("Nilai Hujan Bulanan (Stesen:", stesen_nama, ")"),
+    subtitle = paste(
+      "Garis Trend Tahunan (Kecerunan Sen):", sen_slope_q, "mm/tahun"
+    ),
+    x = "Masa (Tahun)",
+    y = "Jumlah Hujan Bulanan (mm)",
+    color = "Penunjuk Garis"             
+  ) +
+  scale_color_manual(
+    values = c("Kecerunan Sen" = "red2"),  
+    name   = " "             
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title.x = element_text(hjust = 0.5, size = 11, face = "bold"),
+    axis.title.y = element_text(hjust = 0.5, size = 11, face = "bold"),
+    legend.position = "right",            # <-- UPDATED
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+return(p)
+}
+
+list_of_monthly_plots <- lapply(stesen_kolum_fixed, plot_stesen_bulan, data_plot = df_plot_bulan)
+
+print("Memaparkan 4 Plot Bulanan Pertama dengan Garis Trend Tahunan:")
+print(list_of_monthly_plots[[1]])
+print(list_of_monthly_plots[[2]])
+print(list_of_monthly_plots[[3]])
+print(list_of_monthly_plots[[4]])
+
+wrap_plots(list_of_monthly_plots, ncol = 2)+
+  plot_layout(guides = "collect") &         
+  theme(legend.position = "bottom")
+
+
+# Ujian Pettitt
+
+head(df_bulanan)
+hasil_pettitt <- df_bulanan %>%
+  group_by(Stesen) %>%
+  summarise(
+    pettitt = list(pettitt.test(hujan_sum)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_value = sapply(pettitt, \(x) x$p.value),
+    change_point_index = sapply(pettitt, \(x) x$estimate), 
+    statistic = sapply(pettitt, \(x) x$statistic)
+  )
+
+print(hasil_pettitt)
+
+hasil_pettitt <- hasil_pettitt %>%
+  rowwise() %>%
+  mutate(
+    change_date = df_bulanan %>%
+      filter(Stesen == Stesen) %>%
+      slice(change_point_index) %>%
+      select(year, month) %>%
+      paste(collapse = "-")
+  )
+
+print(hasil_pettitt)
+
+df_bulanan_plot <- df_bulanan %>%
+  left_join(hasil_pettitt %>%
+              select(Stesen, p_value, change_point_index),
+            by = "Stesen") %>%
+  group_by(Stesen) %>%
+  mutate(change_year = year[change_point_index[1]]) %>%
+  ungroup()
+
+
+pettitt<-ggplot(df_bulanan_plot, aes(
+  x = as.numeric(paste(year, as.numeric(month), sep = ".")),
+  y = hujan_sum)) +
+  geom_line(color = "blue3", linewidth = 0.8, alpha = 0.9, show.legend = FALSE) +
+  #geom_point(color = "blue4", alpha = 0.6, size = 1.5) + 
+  geom_vline(
+    aes(xintercept = as.numeric(paste(change_year, ".5", sep = "")),
+        color = "Titik Perubahan (Pettitt)"),
+    linetype = "dashed",
+    linewidth = 0.9) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Ujian Pettitt - Titik Perubahan Hujan Bulanan Mengikut Stesen",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan (mm)",
+    color = NULL) +
+  scale_color_manual(
+    name = " ",
+    values = c("Titik Perubahan (Pettitt)" = "red2")) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    strip.text = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(hjust = 0.5, size = 11, face = "bold"),                   
+    axis.title.y = element_text(hjust = 0.5, size = 11, face = "bold"),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    legend.title = element_blank())
+print(pettitt)
+
+df_gabungan <- df_plot_bulan %>%
+  left_join(df_bulanan_plot %>%
+              select(Stesen, change_year),
+            by = "Stesen")
+
+ggplot(df_gabungan, aes(x = Decimal_Date, y = Hujan)) +
+  geom_line(color = "blue3", linewidth = 0.8, alpha = 0.8) +
+  geom_smooth(
+    aes(color = "Garis Linear"),
+    method = "lm", se = FALSE,
+    linetype = "dashed", size = 0.9
+  ) +
+  geom_vline(
+    aes(xintercept = change_year,
+        color = "Titik Perubahan (Pettitt)"),
+    linetype = "dashed", linewidth = 0.9
+  ) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Kecerunan Linear dan Titik Perubahan Mengikut Bulanan Mengikut Stesen",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan (mm)",
+    color = NULL
+  ) +
+  scale_color_manual(
+    name = "",
+    values = c(
+      "Garis Linear" = "red2",
+      "Titik Perubahan (Pettitt)" = "limegreen"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14, margin = margin(t = 5, b = 5)),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.title.x = element_text(size = 10, face = "bold"),
+    axis.title.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    legend.text = element_text(size = 11),
+    legend.title = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+
+
+# Tahunan
+
+df_tahunan <- df_harian %>%
+  group_by(Stesen, year) %>%   
+  summarise(
+    Jumlah_Hujan_Tahunan = sum(Hujan_imp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(date = as.Date(paste(year, "12", "31", sep = "-"))) 
+
+data_intercept_fixed_tahun <- df_tahunan %>%
+  mutate(Tahun = as.numeric(format(date, "%Y"))) %>%
+  rename(Hujan = Jumlah_Hujan_Tahunan) %>%
+  group_by(Stesen) %>%
+  summarise(
+    Avg_Hujan = mean(Hujan, na.rm = TRUE),
+    Avg_Tahun = mean(Tahun, na.rm = TRUE)
+  )
+data_intercept_fixed_tahun
+df_gabung_fixed_tahun <- df_hasil_akhir %>%
+  select(Stesen, Sen_Slope_Q, Test_Interpretation) %>%
+  left_join(data_intercept_fixed_tahun, by = "Stesen") %>%
+  mutate(Intercept = Avg_Hujan - (Sen_Slope_Q * Avg_Tahun))
+
+df_plot_tahun <- df_tahunan %>%
+  mutate(
+    Tahun = as.numeric(format(date, "%Y")),
+    Hujan = Jumlah_Hujan_Tahunan 
+  ) %>%
+  drop_na(Hujan) %>%
+  left_join(df_gabung_fixed_tahun, by = "Stesen")
+
+stesen_kolum_fixed_tahun <- unique(df_plot_tahun$Stesen)
+plot_stesen_tahun <- function(stesen_nama, data_plot) {
+  df_stesen <- filter(data_plot, Stesen == stesen_nama)
+  sen_slope_q <- round(df_stesen$Sen_Slope_Q[1], 2)
+  trend_interp <- df_stesen$Test_Interpretation[1]
+  
+  ggplot(df_stesen, aes(x = year, y = Hujan)) +
+    geom_line(color = "blue4", alpha = 0.9, linewidth = 0.8) +
+    geom_abline(
+      data = df_stesen[1, ],
+      aes(intercept = Intercept, slope = Sen_Slope_Q),
+      color = "red2", linewidth = 1) +
+    labs(
+      title = paste("Nilai Hujan Tahunan (Stesen:", stesen_nama, ")"),
+      subtitle = paste("Garis Trend Tahunan (Kecerunan Sen):", sen_slope_q, "mm/tahun"),
+      x = "Tahun",
+      y = "Jumlah Hujan Tahunan (mm)") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = .5, face = "bold"),
+      plot.subtitle = element_text(hjust = .5),
+      axis.title.x = element_text(size = 11, face = "bold"),
+      axis.title.y = element_text(size = 11, face = "bold"),
+      legend.position = "none",
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6) )
+}
+
+
+list_of_monthly_plots <- lapply(stesen_kolum_fixed_tahun, plot_stesen_tahun, data_plot = df_plot_tahun)
+
+print("Memaparkan 4 Plot Bulanan Pertama dengan Garis Trend Tahunan:")
+print(list_of_monthly_plots[[1]])
+print(list_of_monthly_plots[[2]])
+print(list_of_monthly_plots[[3]])
+print(list_of_monthly_plots[[4]])
+
+wrap_plots(list_of_monthly_plots, ncol = 2)
+
+hasil_pettitt_tahun <- df_tahunan %>%
+  group_by(Stesen) %>%
+  summarise(
+    pettitt = list(pettitt.test(Jumlah_Hujan_Tahunan)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_value = sapply(pettitt, \(x) x$p.value),
+    change_point_index = sapply(pettitt, \(x) x$estimate), 
+    statistic = sapply(pettitt, \(x) x$statistic)
+  )
+hasil_pettitt_tahun <- hasil_pettitt_tahun %>%
+  rowwise() %>%
+  mutate(
+    change_year = {
+      years <- df_tahunan %>%
+        filter(Stesen == Stesen) %>%
+        slice(change_point_index) %>%
+        pull(year)
+      first(years)  
+    }
+  ) %>%
+  ungroup()
+
+print(hasil_pettitt_tahun)
+
+df_tahunan_plot <- df_tahunan %>%
+  left_join(hasil_pettitt_tahun %>%
+              select(Stesen, p_value, change_year),
+            by = "Stesen")
+
+ggplot(df_tahunan_plot, aes(x = year, y = Jumlah_Hujan_Tahunan)) +
+  geom_line(color = "blue4", linewidth = 0.8, alpha = 0.9, show.legend = FALSE) +
+  geom_vline(
+    aes(xintercept = change_year,
+        color = "Titik Perubahan (Pettitt)"),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Ujian Pettitt - Titik Perubahan Hujan Tahunan Mengikut Stesen",
+    subtitle = "Garis merah putus menunjukkan titik perubahan struktur (Pettitt test)",
+    x = "Tahun",
+    y = "Jumlah Hujan Tahunan (mm)",
+    color = NULL
+  ) +
+  scale_color_manual(
+    name = " ",
+    values = c("Titik Perubahan (Pettitt)" = "red2")
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    strip.text = element_text(size = 11, face = "bold"),
+    axis.title.x = element_text(size = 11, face = "bold"),
+    axis.title.y = element_text(size = 11, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10),
+    legend.title = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6)
+  )
+
+
+df_gabungan_tahun <- df_tahunan %>%
+  # Tambah Pettitt results (change_year)
+  left_join(hasil_pettitt_tahun %>%
+              select(Stesen, p_value, change_year),
+            by = "Stesen") %>%
+  # Tambah Sen’s Slope (trend)
+  left_join(df_gabung_fixed_tahun %>%
+              select(Stesen, Sen_Slope_Q, Intercept, Test_Interpretation),
+            by = "Stesen")
+
+sen_pettitt<-ggplot(df_gabungan_tahun, aes(x = year, y = Jumlah_Hujan_Tahunan)) +
+  geom_line(color = "blue4", linewidth = 0.8, alpha = 0.9) +
+  geom_abline(
+  data = df_gabungan_tahun %>% distinct(Stesen, Intercept, Sen_Slope_Q),
+  aes(intercept = Intercept, 
+      slope = Sen_Slope_Q,
+      color = "Kecerunan Sen"),           
+  linewidth = 0.8,
+  linetype = "dashed"
+) +
+geom_vline(
+  aes(
+    xintercept = change_year,
+    color = "Titik Perubahan (Pettitt)"
+  ),
+  linetype = "dashed",
+  linewidth = 0.8
+) +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Kecerunan Sen dan Titik Perubahan Tahunan Mengikut Stesen",
+    x = "Tahun",
+    y = "Jumlah Hujan Tahunan (mm)",
+    color = NULL
+  ) +
+  scale_color_manual(
+    name = "",
+    values = c(
+      "Kecerunan Sen" = "red3",                 
+      "Titik Perubahan (Pettitt)" = "limegreen" 
+    )) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14, margin = margin(t =5, b = 5)),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.title.x = element_text(size = 10, face = "bold"),
+    axis.title.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    legend.text = element_text(size = 11),
+    legend.title = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6))
+print(sen_pettitt)
+
+
+# OBJEKTIF 2
+
+raifyp <- fyp3 %>%
+  left_join(iah, by = c("Stesen", "Bulan")) %>%
+  mutate(
+    RAI = case_when(
+      SD_Bulanan == 0 ~ 0, 
+      TRUE ~ (hujan_sum - LTA_Bulanan) / SD_Bulanan
+    )) %>%
+  select(Tarikh, Stesen, hujan_sum, Bulan ,Tahun, LTA_Bulanan, SD_Bulanan, RAI, Avg_Temp, Avg_Humidity, Sum_Precip)
+
+warna_stesen <- c(
+  "0240411RF BT.30" = "blue3",
+  "0240441RF S.K. KG. LUI" = "blue3",
+  "0240781RF SG. SERAI BATU 12" = "blue3",
+  "0240821RF  BALAI POLIS BATU 14" = "blue3"
+)
+
+threshold_sangat <- c(3, -3)
+threshold_amat <- c(2, -2)
+
+p1<-ggplot(raifyp, aes(x = Tarikh, y = RAI, color = Stesen)) +
+  geom_hline(
+    aes(yintercept = threshold_sangat[1], linetype = "Sangat Lembap / Kering (±3)"),
+    color = "red2", linewidth = 0.7, alpha = 0.8
+  ) +
+  geom_hline(
+    aes(yintercept = threshold_amat[1], linetype = "Amat Lembap / Kering (±2)"),
+    color = "gray40", linewidth = 0.7, alpha = 0.8
+  ) +
+  geom_hline(aes(yintercept = threshold_sangat[2],linetype = "Sangat Lembap / Kering (±3)"), color = "red2", linewidth = 0.7, alpha = 0.8) +
+  geom_hline(aes(yintercept = threshold_amat[2], linetype = "Amat Lembap / Kering (±2)"), color = "gray40", linewidth = 0.7, alpha = 0.8) +
+  geom_line(linewidth = 0.9, alpha = 0.9, na.rm = TRUE) +
+  facet_wrap(~ Stesen, ncol = 1, scales = "free_y") +
+  labs ( title = "Indeks Anomali Hujan Mengikut Stesen",
+         x = "Tarikh",
+         y = "Indeks Anomali Hujan",
+         linetype = "Nilai Ambang"
+  ) +
+  scale_color_manual(values = warna_stesen) +
+  scale_linetype_manual(
+    name = "Nilai Ambang",
+    values = c(
+      "Sangat Lembap / Kering (±3)" = "solid",
+      "Amat Lembap / Kering (±2)" = "dashed"
+    )
+  ) +
+  guides(color = "none") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5, face = "bold", size = 15,
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5, size = 12, color = "gray25"
+    ),
+    axis.title.x = element_text(size = 11, face = "bold"),
+    axis.title.y = element_text(size = 11, face = "bold"),
+    axis.text.x = element_text(size = 11, hjust = 1, color = "gray20"),
+    axis.text.y = element_text(size = 11, color = "gray20"),
+    strip.text = element_text(size = 11, face = "bold", color = "black"),
+    panel.grid.major = element_line(color = "gray85", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+p1
+ggsave("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\DRAFT 0711\\rajah\\RAI.png", p1, width = 12, height = 8, dpi = 300)
+print("\nJadual Indeks Anomali Hujan Harian (RAI):")
+print(tail(raifyp))
+raifyp <- raifyp %>%
+  mutate(
+    RAI_Class = case_when(
+      RAI > 3.00 ~ "9-Sangat Lembap",
+      RAI > 2.00 & RAI <= 3.00 ~ "8-Amat Lembap",
+      RAI > 1.00 & RAI <= 2.00 ~ "7-Lembap",
+      RAI > 0.50 & RAI <= 1.00 ~ "6-Hampir Lembap",
+      RAI >= -0.50 & RAI <= 0.50 ~ "5-Hampir Normal", 
+      RAI < -0.50 & RAI >= -1.00 ~ "4-Hampir Kering",
+      RAI < -1.00 & RAI >= -2.00 ~ "3-Kering",
+      RAI < -2.00 & RAI >= -3.00 ~ "2-Amat Kering",
+      RAI < -3.00 ~ "1-Sangat Kering",
+      TRUE ~ "NA"
+    )
+  )
+print("\nJadual Klasifikasi RAI Harian:")
+head(raifyp)
+write.csv(raifyp, "C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\data_rai_1811.csv", row.names = FALSE)
+
+kelas_order <- c(
+  "1-Sangat Kering","2-Amat Kering","3-Kering","4-Hampir Kering",
+  "5-Hampir Normal","6-Hampir Lembap","7-Lembap","8-Amat Lembap","9-Sangat Lembap"
+)
+
+dat_bar <- raifyp %>%
+  mutate(
+    Bulan = factor(month(Tarikh, label = TRUE, abbr = TRUE), levels = month.abb),
+    RAI_Class = factor(RAI_Class, levels = kelas_order)
+  ) %>%
+  group_by(Stesen, Bulan, RAI_Class) %>%
+  summarise(Hari = n(), .groups = "drop")
+
+data_tahun <- raifyp %>%
+  mutate(
+    RAI_Class = factor(RAI_Class, levels = kelas_order)
+  ) %>%
+  group_by(Stesen, Tahun, RAI_Class) %>%
+  summarise(Hari = n(), .groups = "drop")
+View(dat_bar)
+
+iah1<-ggplot(dat_bar, aes(Bulan, Hari, fill = RAI_Class)) +
+  geom_col() +
+  facet_wrap(~ Stesen, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Kekerapan Klasifikasi Indeks Anomali Hujan — Mengikut Bulan & Stesen",
+    x = "Bulan", y = "Kekerapan", fill = NULL
+  ) +
+  scale_fill_manual(values = c(
+    "1-Sangat Kering" = "#542788",
+    "2-Amat Kering"   = "#8073ac",
+    "3-Kering"        = "#b2abd2",
+    "4-Hampir Kering" = "#d8daeb",
+    "5-Hampir Normal" = "grey70",
+    "6-Hampir Lembap" = "#bde2a8",
+    "7-Lembap"        = "#7fbc41",
+    "8-Amat Lembap"   = "#41ab5d",
+    "9-Sangat Lembap" = "#006d2c"
+  )) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16,  margin = margin(t =15, b = 15)),
+    #plot.subtitle = element_text(hjust = 0.5, size = 11),
+    strip.text = element_text(face = "bold", size = 11),
+    axis.title.x = element_text(size = 11, face = "bold"),
+    axis.title.y = element_text(size = 11, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    strip.background = element_rect(fill = "grey95", colour = "black", linewidth = 0.6)
+  )
+iah1
+ggsave("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\DRAFT 0711\\rajah\\RAI clustered bulan.png", iah1, width = 12, height = 8, dpi = 300)
+
+#2021 je
+tahun21_only <- raifyp %>%
+  mutate(
+    Tarikh = as.Date(Tarikh),
+    Tahun  = year(Tarikh),
+    Bulan  = month(Tarikh),
+    RAI_Class = factor(RAI_Class, levels = kelas_order)
+  ) %>%
+  filter(Tahun == 2021)
+View(tahun21_only)
+data_tahun_21 <- tahun21_only %>%
+  mutate(
+    RAI_Class = factor(RAI_Class, levels = kelas_order)
+  ) %>%
+  group_by(Stesen, Tahun, Bulan, RAI_Class) %>%
+  summarise(Hari = n(), .groups = "drop")
+
+View(data_tahun_21)
+iah21<-ggplot(data_tahun_21, aes(x = Bulan, y = Stesen, fill = RAI_Class)) +
+  geom_tile(color = "white", lwd = 0.5) + 
+  scale_fill_manual(values = warna_rai) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(
+    title = "Corak Indeks Anomali Hujan (RAI) Bulanan Tahun 2021",
+    subtitle = "Visualisasi Perubahan Iklim Sepanjang Tahun Mengikut Stesen",
+    x = "Bulan",
+    y = NULL,
+    fill = "Kelas RAI"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid = element_blank(), 
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11, face = "bold"),
+    legend.position = "bottom", 
+    legend.title = element_text(vjust = 1) 
+  ) +
+  coord_fixed(ratio = 1)
+
+
+# OBJEKTIF 3
+
+# Stesen BT. 30
+
+TRAIN_END <- as.Date("2021-01-01") 
+TEST_END <- as.Date("2024-12-01")
+
+train_411 <- d411 %>% filter(Tarikh < TRAIN_END)
+test_411 <- d411 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+
+train_411
+xreg_train_matrix <- as.matrix(
+  train_411 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+xreg_test_matrix <- as.matrix(
+  test_411 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+x_center_arima_411 <- colMeans(xreg_train_matrix)
+x_scale_arima_411  <- apply(xreg_train_matrix, 2, sd)
+
+x_scale_arima_411[x_scale_arima_411 == 0] <- 1
+
+xreg_train_sc_411 <- scale(
+  xreg_train_matrix,
+  center = x_center_arima_411,
+  scale  = x_scale_arima_411
+)
+
+xreg_test_sc_411 <- scale(
+  xreg_test_matrix,
+  center = x_center_arima_411,
+  scale  = x_scale_arima_411
+)
+
+acf_411 <- acf(train_411$hujan_sum, lag.max = 24, main = "ACF 0240411RF BT.30")
+pacf_411 <- pacf(train_411$hujan_sum, lag.max = 24, main = "PACF 0240411RF BT.30")
+acf_411 <- ggAcf(train_411$hujan_sum, lag.max = 24) +
+  ggtitle("ACF Stesen: BT.30")+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+pacf_411 <- ggPacf(train_411$hujan_sum, lag.max = 24) +
+  ggtitle("PACF Stesen: BT.30") +
+  theme_minimal(base_size = 13)+
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+combined_acf_pacf_411 <- acf_411 / pacf_411
+adf.test(y_train_arima_ts_411)
+
+y_train_arima_411 <- train_411$hujan_sum
+y_test_arima_411  <- test_411$hujan_sum
+y_train_arima_ts_411 <- ts(y_train_arima_411, frequency = 12)
+
+
+model1_411 <- Arima(
+  y_train_arima_ts_411,
+  xreg = xreg_train_sc_411,
+  order = c(0,0,0),
+  seasonal = c(2,1,0)
+)
+summary(model1_411)
+checkresiduals(model1_411)
+
+h_arima_411 <- nrow(test_411)
+fc_arima_411 <- forecast(model1_411, h = h_arima_411, xreg = xreg_test_sc_411)
+fitted_train_arima_411 <- as.numeric(fitted(model1_411))
+y_train_arima_411      <- train_411$hujan_sum        
+
+y_arima_pred_test_411 <- as.numeric(fc_arima_411$mean)
+y_test_arima_411       <- test_411$hujan_sum    
+
+calc_metrics <- function(actual, predicted) {
+  ralat <- actual - predicted
+  MSE <- mean(ralat^2, na.rm = TRUE)
+  RMSE <- sqrt(MSE)
+  MAE  <- mean(abs(ralat), na.rm = TRUE)
+  percent_error <- abs(ralat / actual) * 100
+  percent_error[is.infinite(percent_error)] <- NA
+  MAPE <- mean(percent_error, na.rm = TRUE)
+  RSS <- sum(ralat^2, na.rm = TRUE)
+  TSS <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  R_squared <- 1 - (RSS / TSS)
+  data.frame(MSE, RMSE, MAE,MAPE, R_squared)
+}
+
+train_metrics_arima_411 <- calc_metrics(y_train_arima_411, fitted_train_arima_411)
+test_metrics_arima_411  <- calc_metrics(y_test_arima_411, y_arima_pred_test_411)
+
+bind_rows(
+  "Train ARIMAX" = train_metrics_arima_411,
+  "Test ARIMAX"  = test_metrics_arima_411,
+  .id = "Dataset" )
+
+PLOT_End <- as.Date("2024-12-01")
+PLOT_Start <- as.Date("2010-01-01")
+
+sebenar_arima_411 <- train_411 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_test_411 <- test_411 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_arima_411 <- tibble(
+  Tarikh = train_411$Tarikh,
+  value  = fitted_train_arima_411, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_arima_411 <- tibble(
+  Tarikh = test_411$Tarikh,
+  value  = y_arima_pred_test_411, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+plot_arimax_411 <- bind_rows(
+  sebenar_arima_411,
+  sebenar_test_411, 
+  fitted_train_arima_411, 
+  fitted_test_arima_411
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+plot_arimax_411 <- plot_arimax_411 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_sarimax_411 <- ggplot(plot_arimax_411, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(plot_arimax_411$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model SARIMAX (Stesen: BT.30)",
+    subtitle = "SARIMAX (0,0,0)(2,1,0)[12]",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+(plot_sarimax_411)
+
+data_2021 <- plot_arimax_411 %>%
+  filter(format(date, "%Y") == "2021")
+data_2021
+
+df_long <- plot_arimax_411 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_sarimax_411 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi SARIMAX: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: BT.30",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank())
+
+
+# Model XGBoost
+
+xgb_d411 <- bulan %>% filter (Stesen == "0240411RF BT.30" ) %>%
+  mutate(
+    lag_12 = lag(hujan_sum, n = 12)) %>%
+  arrange(Tarikh) %>% na.omit()
+
+train_xgb_411 <- xgb_d411 %>% filter(Tarikh < TRAIN_END)
+test_xgb_411 <- xgb_d411 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+features_411 <- c("Avg_Temp", "Avg_Humidity", "Sum_Precip", "lag_12")
+target_411   <- "hujan_sum"
+train_ok <- is.finite(rowSums(x_train_xgb)) & is.finite(y_train_xgb)
+
+all_411 <- bind_rows(
+  train_xgb_411 %>% mutate(Set = "Train"),
+  test_xgb_411  %>% mutate(Set = "Test")
+)
+
+dummy_xgb <- dummyVars(
+  formula = ~ Avg_Temp + Avg_Humidity + Sum_Precip + lag_12,
+  data    = all_411
+)
+
+all_xgb_mat <- predict(dummy_xgb, newdata = all_411) %>% as.matrix()
+
+train_idx <- all_411$Set == "Train"
+all_y <- all_411$hujan_sum
+
+x_train_xgb <- all_xgb_mat[train_idx, ]
+y_train_xgb <- all_y[train_idx]
+
+x_test_xgb <- all_xgb_mat[!train_idx, ]
+y_test_xgb <- all_y[!train_idx]
+
+dtrain_411 <- xgb.DMatrix(data = x_train_xgb, label = y_train_xgb)
+dtest_411  <- xgb.DMatrix(data = x_test_xgb,  label = y_test_xgb)
+
+params_411 <- list(
+  objective = "reg:squarederror", 
+  eval_metric = "rmse",
+  eta = 0.05,                     
+  max_depth = 3,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 1
+)
+
+watchlist <- list(
+  train = dtrain_411,
+  eval  = dtest_411
+)
+
+set.seed(123)
+xgb_411 <- xgb.train(
+  params = params_411,
+  data = dtrain_411,
+  nrounds = 200,
+  watchlist = watchlist,
+  early_stopping_rounds = 20,
+  print_every_n = 50
+)
+
+feature_names <- colnames(x_train_xgb)
+importance_xgb_411 <- xgb.importance(
+  feature_names = feature_names,
+  model = xgb_411
+)
+
+print(importance_xgb_411)
+
+xgb.plot.importance(importance_xgb_411,
+                    main = "Kepentingan Pembolehubah (Stesen: BT.30)",col = "steelblue")
+rename_vars <- c(
+  "Avg_Temp"     = "Suhu Purata",
+  "Avg_Humidity" = "Kelembapan Purata",
+  "Sum_Precip"   = "Jumlah Kerpasan",
+  "lag_12"   = "Lag 12"
+)
+importance_xgb_411$Feature <- rename_vars[importance_xgb_411$Feature]
+
+
+imp_xgb_411 <- ggplot(importance_xgb_411, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +     
+  coord_flip() +
+  labs(
+    title = "Kepentingan Pemboleh Ubah (Stesen: BT.30)",
+    x = "Pemboleh Ubah",
+    y = "Nilai Kepentingan Pemboleh Ubah"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12,
+                              margin = ggplot2::margin(t = 15, b = 5))
+  )
+
+
+xgb_train_pred_411 <- predict(xgb_411, dtrain_411)
+xgb_test_pred_411  <- predict(xgb_411, dtest_411)
+
+train_metrics_xgb_411 <- calc_metrics(y_train_xgb, xgb_train_pred_411)
+test_metrics_xgb_411  <- calc_metrics(y_test_xgb,  xgb_test_pred_411)
+
+bind_rows(
+  "Train XGBoost" = train_metrics_xgb_411,
+  "Test XGBoost"  = test_metrics_xgb_411,
+  .id = "Dataset"
+)
+
+
+sebenar_xgb_411 <- train_xgb_411 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_xgbt_411 <- test_xgb_411 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_xgb_411 <- tibble(
+  Tarikh = train_xgb_411$Tarikh,
+  value  = xgb_train_pred_411, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_xgb_411 <- tibble(
+  Tarikh = test_xgb_411$Tarikh,
+  value  = xgb_test_pred_411, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+data_plot_xgb_411 <- bind_rows(
+  sebenar_xgb_411,
+  sebenar_xgbt_411, 
+  fitted_train_xgb_411, 
+  fitted_test_xgb_411
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+data_plot_xgb_411 <- data_plot_xgb_411 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_xgb_411 <- ggplot(data_plot_xgb_411, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(data_plot_xgb_411$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model XGBoost (Stesen: BT.30)",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+plot_xgb_411
+
+data_2021 <- data_plot_xgb_411 %>%
+  filter(format(date, "%Y") == "2021")
+data_2021
+
+df_long <- data_plot_xgb_411 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_xgb_411 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi XGBoost: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: BT.30",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+# SK Kg. Lui
+
+train_441 <- d441 %>% filter(Tarikh < TRAIN_END)
+test_441 <- d441 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+
+xreg_train_matrix <- as.matrix(
+  train_441 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+xreg_test_matrix <- as.matrix(
+  test_441 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+x_center_arima_441 <- colMeans(xreg_train_matrix)
+x_scale_arima_441  <- apply(xreg_train_matrix, 2, sd)
+
+x_scale_arima_441[x_scale_arima_441 == 0] <- 1
+
+xreg_train_sc_441 <- scale(
+  xreg_train_matrix,
+  center = x_center_arima_441,
+  scale  = x_scale_arima_441
+)
+
+xreg_test_sc_441 <- scale(
+  xreg_test_matrix,
+  center = x_center_arima_441,
+  scale  = x_scale_arima_441
+)
+
+acf_441 <- acf(train_441$hujan_sum, lag.max = 24, main = "ACF 0240441RF BT.30")
+pacf_441 <- pacf(train_441$hujan_sum, lag.max = 24, main = "PACF 0240441RF BT.30")
+acf_441 <- ggAcf(train_441$hujan_sum, lag.max = 24) +
+  ggtitle("ACF Stesen: S.K. Kg. Lui")+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+pacf_441 <- ggPacf(train_441$hujan_sum, lag.max = 24) +
+  ggtitle("PACF Stesen: S.K. Kg. Lui") +
+  theme_minimal(base_size = 13)+
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+combined_acf_pacf_441 <- acf_441 / pacf_441
+
+y_train_arima_441 <- train_441$hujan_sum
+y_test_arima_441  <- test_441$hujan_sum
+y_train_arima_ts_441 <- ts(y_train_arima_441, frequency = 12)
+adf.test(y_train_arima_ts_441)
+
+model1_441 <- Arima(
+  y_train_arima_ts_441,
+  xreg = xreg_train_sc_441,
+  order = c(0,0,0),
+  seasonal = c(2,1,0)
+)
+summary(model1_441)
+checkresiduals(model1_441)
+
+h_arima_441 <- nrow(test_441)
+fc_arima_441 <- forecast(model1_441, h = h_arima_441, xreg = xreg_test_sc_441)
+fitted_train_arima_441 <- as.numeric(fitted(model1_441))
+y_train_arima_441      <- train_441$hujan_sum        
+
+y_arima_pred_test_441 <- as.numeric(fc_arima_441$mean)
+y_test_arima_441       <- test_441$hujan_sum    
+
+calc_metrics <- function(actual, predicted) {
+  ralat <- actual - predicted
+  MSE <- mean(ralat^2, na.rm = TRUE)
+  RMSE <- sqrt(MSE)
+  MAE  <- mean(abs(ralat), na.rm = TRUE)
+  percent_error <- abs(ralat / actual) * 100
+  percent_error[is.infinite(percent_error)] <- NA
+  MAPE <- mean(percent_error, na.rm = TRUE)
+  RSS <- sum(ralat^2, na.rm = TRUE)
+  TSS <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  R_squared <- 1 - (RSS / TSS)
+  data.frame(MSE, RMSE, MAE,MAPE, R_squared)
+}
+
+train_metrics_arima_441 <- calc_metrics(y_train_arima_441, fitted_train_arima_441)
+test_metrics_arima_441  <- calc_metrics(y_test_arima_441, y_arima_pred_test_441)
+
+bind_rows(
+  "Train ARIMAX" = train_metrics_arima_441,
+  "Test ARIMAX"  = test_metrics_arima_441,
+  .id = "Dataset" )
+
+PLOT_End <- as.Date("2024-12-01")
+PLOT_Start <- as.Date("2010-01-01")
+
+sebenar_arima_441 <- train_441 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_test_441 <- test_441 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_arima_441 <- tibble(
+  Tarikh = train_441$Tarikh,
+  value  = fitted_train_arima_441, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_arima_441 <- tibble(
+  Tarikh = test_441$Tarikh,
+  value  = y_arima_pred_test_441, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+plot_arimax_441 <- bind_rows(
+  sebenar_arima_441,
+  sebenar_test_441, 
+  fitted_train_arima_441, 
+  fitted_test_arima_441
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+plot_arimax_441 <- plot_arimax_441 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_sarimax_441 <- ggplot(plot_arimax_441, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(plot_arimax_441$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model SARIMAX (Stesen: S.K. Kg. Lui)",
+    subtitle = "SARIMAX (0,0,0)(2,1,0)[12]",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+    #panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.1)
+  )
+
+plot_sarimax_441
+
+
+df_long <- plot_arimax_441 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_sarimax_441 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi SARIMAX: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: S.K. Kg. Lui",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank())
+
+
+# Model XGBoost
+
+xgb_d441 <- bulan %>% filter (Stesen == "0240441RF S.K. KG. LUI" ) %>%
+  mutate(
+    lag_12 = lag(hujan_sum, n = 12)) %>%
+  arrange(Tarikh)
+
+train_xgb_441 <- xgb_d441 %>% filter(Tarikh < TRAIN_END)
+test_xgb_441 <- xgb_d441 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+features_441 <- c("Avg_Temp", "Avg_Humidity", "Sum_Precip", "lag_12")
+target_441   <- "hujan_sum"
+
+# Tambah lajur Set untuk split balik
+all_441 <- bind_rows(
+  train_xgb_441 %>% mutate(Set = "Train"),
+  test_xgb_441  %>% mutate(Set = "Test")
+)
+
+dummy_xgb <- dummyVars(
+  formula = ~ Avg_Temp + Avg_Humidity + Sum_Precip + lag_12,
+  data    = all_441
+)
+
+all_xgb_mat <- predict(dummy_xgb, newdata = all_441) %>% as.matrix()
+
+train_idx <- all_441$Set == "Train"
+all_y <- all_441$hujan_sum
+
+x_train_xgb <- all_xgb_mat[train_idx, ]
+y_train_xgb <- all_y[train_idx]
+
+x_test_xgb <- all_xgb_mat[!train_idx, ]
+y_test_xgb <- all_y[!train_idx]
+
+dtrain_441 <- xgb.DMatrix(data = x_train_xgb, label = y_train_xgb)
+dtest_441  <- xgb.DMatrix(data = x_test_xgb,  label = y_test_xgb)
+
+params_441 <- list(
+  objective = "reg:squarederror", # regresi
+  eval_metric = "rmse",
+  eta = 0.05,                     # learning rate
+  max_depth = 3,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 1
+)
+
+watchlist <- list(
+  train = dtrain_441,
+  eval  = dtest_441
+)
+
+set.seed(123)
+xgb_441 <- xgb.train(
+  params = params_441,
+  data = dtrain_441,
+  nrounds = 200,
+  watchlist = watchlist,
+  early_stopping_rounds = 20,
+  print_every_n = 50
+)
+
+feature_names <- colnames(x_train_xgb)
+importance_xgb_441 <- xgb.importance(
+  feature_names = feature_names,
+  model = xgb_441
+)
+
+print(importance_xgb_441)
+
+xgb.plot.importance(importance_xgb_441,
+                    main = "Kepentingan Pembolehubah dalam Model XGBoost (Stesen 0240441RF S.K. KG. LUI)",col = "steelblue")
+rename_vars <- c(
+  "Avg_Temp"     = "Suhu Purata",
+  "Avg_Humidity" = "Kelembapan Purata",
+  "Sum_Precip"   = "Jumlah Kerpasan",
+  "lag_12" = "Lag 12"
+)
+importance_xgb_441$Feature <- rename_vars[importance_xgb_441$Feature]
+
+
+imp_xgb_441 <- ggplot(importance_xgb_441, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +     
+  coord_flip() +
+  labs(
+    title = "Kepentingan Pemboleh Ubah (Stesen: S.K. Kg. Lui)",
+    x = "Pemboleh Ubah",
+    y = "Nilai Kepentingan Pemboleh Ubah"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12,
+                              margin = ggplot2::margin(t = 15, b = 5))
+  )
+
+
+xgb_train_pred_441 <- predict(xgb_441, dtrain_441)
+xgb_test_pred_441  <- predict(xgb_441, dtest_441)
+
+train_metrics_xgb_441 <- calc_metrics(y_train_xgb, xgb_train_pred_441)
+test_metrics_xgb_441  <- calc_metrics(y_test_xgb,  xgb_test_pred_441)
+
+bind_rows(
+  "Train XGBoost" = train_metrics_xgb_441,
+  "Test XGBoost"  = test_metrics_xgb_441,
+  .id = "Dataset"
+)
+
+sebenar_xgb_441 <- train_xgb_441 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_xgbt_441 <- test_xgb_441 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_xgb_441 <- tibble(
+  Tarikh = train_xgb_441$Tarikh,
+  value  = xgb_train_pred_441, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_xgb_441 <- tibble(
+  Tarikh = test_xgb_441$Tarikh,
+  value  = xgb_test_pred_441, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+data_plot_xgb_441 <- bind_rows(
+  sebenar_xgb_441,
+  sebenar_xgbt_441, 
+  fitted_train_xgb_441, 
+  fitted_test_xgb_441
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+data_plot_xgb_441 <- data_plot_xgb_441 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_xgb_441 <- ggplot(data_plot_xgb_441, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(data_plot_xgb_441$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model XGBoost (Stesen: S.K. Kg. Lui)",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+plot_xgb_441
+
+df_long <- data_plot_xgb_441 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_xgb_441 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi XGBoost: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: S.K. Kg. Lui",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+sarimax_2021 <- plot_arimax_441 %>%
+  filter(format(date, "%Y") == "2021")
+sarimax_2021
+
+xgb_2021 <- data_plot_xgb_441 %>%
+  filter(format(date, "%Y") == "2021")
+xgb_2021
+
+#Sg Serai Batu 12
+
+train_781 <- d781 %>% filter(Tarikh < TRAIN_END)
+test_781 <- d781 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+
+xreg_train_matrix <- as.matrix(
+  train_781 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+xreg_test_matrix <- as.matrix(
+  test_781 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+x_center_arima_781 <- colMeans(xreg_train_matrix)
+x_scale_arima_781  <- apply(xreg_train_matrix, 2, sd)
+
+x_scale_arima_781[x_scale_arima_781 == 0] <- 1
+
+xreg_train_sc_781 <- scale(
+  xreg_train_matrix,
+  center = x_center_arima_781,
+  scale  = x_scale_arima_781
+)
+
+xreg_test_sc_781 <- scale(
+  xreg_test_matrix,
+  center = x_center_arima_781,
+  scale  = x_scale_arima_781
+)
+
+acf_781 <- acf(train_781$hujan_sum, lag.max = 24, main = "ACF 0240781RF SG. SERAI BATU 12")
+pacf_781 <- pacf(train_781$hujan_sum, lag.max = 24, main = "PACF 0240781RF SG. SERAI BATU 12")
+acf_781 <- ggAcf(train_781$hujan_sum, lag.max = 24) +
+  ggtitle("ACF Stesen: Sg. Serai Batu 12")+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+pacf_781 <- ggPacf(train_781$hujan_sum, lag.max = 24) +
+  ggtitle("PACF Stesen: Sg. Serai Batu 12") +
+  theme_minimal(base_size = 13)+
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+combined_acf_pacf_781 <- acf_781 / pacf_781
+
+y_train_arima_781 <- train_781$hujan_sum
+y_test_arima_781  <- test_781$hujan_sum
+y_train_arima_ts_781 <- ts(y_train_arima_781, frequency = 12)
+adf.test(y_train_arima_ts_781)
+
+model_arima_781 <- auto.arima(y_train_arima_ts_781,
+                              xreg = xreg_train_sc_781,
+                              seasonal = TRUE,
+                              stepwise = FALSE,
+                              approximation = FALSE)
+
+summary(model_arima_781)
+checkresiduals(model_arima_781)
+
+model1_781 <- Arima(
+  y_train_arima_ts_781,
+  xreg = xreg_train_sc_781,
+  order = c(0,0,0),
+  seasonal = c(2,1,0)
+)
+summary(model1_781)
+checkresiduals(model1_781)
+
+h_arima_781 <- nrow(test_781)
+fc_arima_781 <- forecast(model1_781, h = h_arima_781, xreg = xreg_test_sc_781)
+fitted_train_arima_781 <- as.numeric(fitted(model1_781))
+y_train_arima_781      <- train_781$hujan_sum        
+
+y_arima_pred_test_781 <- as.numeric(fc_arima_781$mean)
+y_test_arima_781       <- test_781$hujan_sum    
+
+calc_metrics <- function(actual, predicted) {
+  ralat <- actual - predicted
+  MSE <- mean(ralat^2, na.rm = TRUE)
+  RMSE <- sqrt(MSE)
+  MAE  <- mean(abs(ralat), na.rm = TRUE)
+  percent_error <- abs(ralat / actual) * 100
+  percent_error[is.infinite(percent_error)] <- NA
+  MAPE <- mean(percent_error, na.rm = TRUE)
+  RSS <- sum(ralat^2, na.rm = TRUE)
+  TSS <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  R_squared <- 1 - (RSS / TSS)
+  data.frame(MSE, RMSE, MAE,MAPE, R_squared)
+}
+
+train_metrics_arima_781 <- calc_metrics(y_train_arima_781, fitted_train_arima_781)
+test_metrics_arima_781  <- calc_metrics(y_test_arima_781, y_arima_pred_test_781)
+
+bind_rows(
+  "Train ARIMAX" = train_metrics_arima_781,
+  "Test ARIMAX"  = test_metrics_arima_781,
+  .id = "Dataset" )
+
+PLOT_End <- as.Date("2024-12-01")
+PLOT_Start <- as.Date("2010-01-01")
+
+sebenar_arima_781 <- train_781 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_test_781 <- test_781 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_arima_781 <- tibble(
+  Tarikh = train_781$Tarikh,
+  value  = fitted_train_arima_781, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_arima_781 <- tibble(
+  Tarikh = test_781$Tarikh,
+  value  = y_arima_pred_test_781, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+plot_arimax_781 <- bind_rows(
+  sebenar_arima_781,
+  sebenar_test_781, 
+  fitted_train_arima_781, 
+  fitted_test_arima_781
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+plot_arimax_781 <- plot_arimax_781 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_sarimax_781 <- ggplot(plot_arimax_781, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(plot_arimax_781$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model SARIMAX (Stesen: Sg. Serai Batu 12)",
+    subtitle = "SARIMAX (0,0,0)(2,1,0)[12]",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+    #panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.1)
+  )
+
+plot_sarimax_781
+
+
+df_long <- plot_arimax_781 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_sarimax_781 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi SARIMAX: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: Sg. Serai Batu 12",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+
+# Model XGBoost
+
+xgb_d781 <- bulan %>% filter (Stesen == "0240781RF SG. SERAI BATU 12" ) %>%
+  mutate(
+    lag_12 = lag(hujan_sum, n = 12)) %>%
+  arrange(Tarikh) %>% na.omit()
+
+train_xgb_781 <- xgb_d781 %>% filter(Tarikh < TRAIN_END)
+test_xgb_781 <- xgb_d781 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+features_781 <- c("Avg_Temp", "Avg_Humidity", "Sum_Precip", "lag_12")
+target_781   <- "hujan_sum"
+
+# Tambah lajur Set untuk split balik
+all_781 <- bind_rows(
+  train_xgb_781 %>% mutate(Set = "Train"),
+  test_xgb_781  %>% mutate(Set = "Test")
+)
+
+dummy_xgb <- dummyVars(
+  formula = ~ Avg_Temp + Avg_Humidity + Sum_Precip + lag_12,
+  data    = all_781
+)
+
+all_xgb_mat <- predict(dummy_xgb, newdata = all_781) %>% as.matrix()
+
+train_idx <- all_781$Set == "Train"
+all_y <- all_781$hujan_sum
+
+x_train_xgb <- all_xgb_mat[train_idx, ]
+y_train_xgb <- all_y[train_idx]
+
+x_test_xgb <- all_xgb_mat[!train_idx, ]
+y_test_xgb <- all_y[!train_idx]
+
+dtrain_781 <- xgb.DMatrix(data = x_train_xgb, label = y_train_xgb)
+dtest_781  <- xgb.DMatrix(data = x_test_xgb,  label = y_test_xgb)
+
+eta_vals <- c(0.01, 0.05, 0.1)
+max_depth_vals <- c(3, 5, 7)
+min_child_vals <- c(1, 3, 5)
+subsample_vals <- c(0.7, 0.8, 0.9)
+colsample_vals <- c(0.7, 0.8, 0.9)
+
+results <- data.frame()
+
+for (eta in eta_vals) {
+  for (md in max_depth_vals) {
+    for (mc in min_child_vals) {
+      for (ss in subsample_vals) {
+        for (cs in colsample_vals) {
+          
+          params <- list(
+            objective = "reg:squarederror",
+            eval_metric = "rmse",
+            eta = eta,
+            max_depth = md,
+            min_child_weight = mc,
+            subsample = ss,
+            colsample_bytree = cs
+          )
+          
+          cv <- xgb.cv(
+            params = params,
+            data = dtrain_781,
+            nrounds = 500,
+            nfold = 5,
+            early_stopping_rounds = 20,
+            verbose = 0
+          )
+          
+          results <- rbind(
+            results,
+            data.frame(
+              eta = eta,
+              max_depth = md,
+              min_child_weight = mc,
+              subsample = ss,
+              colsample_bytree = cs,
+              best_rmse = cv$evaluation_log[cv$best_iteration]$test_rmse_mean
+            )
+          )
+        }
+      }
+    }
+  }
+}
+
+best_params <- results[which.min(results$best_rmse), ]
+best_params
+
+params_781 <- list(
+  objective = "reg:squarederror", 
+  eval_metric = "rmse",
+  eta = 0.05,                     
+  max_depth = 3,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 1
+)
+
+watchlist <- list(
+  train = dtrain_781,
+  eval  = dtest_781
+)
+
+set.seed(123)
+xgb_781 <- xgb.train(
+  params = params_781,
+  data = dtrain_781,
+  nrounds = 200,
+  watchlist = watchlist,
+  early_stopping_rounds = 20,
+  print_every_n = 50
+)
+
+feature_names <- colnames(x_train_xgb)
+importance_xgb_781 <- xgb.importance(
+  feature_names = feature_names,
+  model = xgb_781
+)
+
+xgb.plot.importance(importance_xgb_781,
+                    main = "Kepentingan Pembolehubah dalam Model XGBoost (Stesen 0240781RF SG. SERAI BATU 12)",col = "steelblue")
+rename_vars <- c(
+  "Avg_Temp"     = "Suhu Purata",
+  "Avg_Humidity" = "Kelembapan Purata",
+  "Sum_Precip"   = "Jumlah Kerpasan",
+  "lag_12" = "Lag 12"
+)
+importance_xgb_781$Feature <- rename_vars[importance_xgb_781$Feature]
+
+imp_xgb_781 <- ggplot(importance_xgb_781, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +     
+  coord_flip() +
+  labs(
+    title = "Kepentingan Pemboleh Ubah (Stesen: Sg. Serai Batu 12)",
+    x = "Pemboleh Ubah",
+    y = "Nilai Kepentingan Pemboleh Ubah"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12,
+                              margin = ggplot2::margin(t = 15, b = 5))
+  )
+
+
+xgb_train_pred_781 <- predict(xgb_781, dtrain_781)
+xgb_test_pred_781  <- predict(xgb_781, dtest_781)
+
+train_metrics_xgb_781 <- calc_metrics(y_train_xgb, xgb_train_pred_781)
+test_metrics_xgb_781  <- calc_metrics(y_test_xgb,  xgb_test_pred_781)
+
+bind_rows(
+  "Train XGBoost" = train_metrics_xgb_781,
+  "Test XGBoost"  = test_metrics_xgb_781,
+  .id = "Dataset"
+)
+
+sebenar_xgb_781 <- train_xgb_781 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_xgbt_781 <- test_xgb_781 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_xgb_781 <- tibble(
+  Tarikh = train_xgb_781$Tarikh,
+  value  = xgb_train_pred_781, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_xgb_781 <- tibble(
+  Tarikh = test_xgb_781$Tarikh,
+  value  = xgb_test_pred_781, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+data_plot_xgb_781 <- bind_rows(
+  sebenar_xgb_781,
+  sebenar_xgbt_781, 
+  fitted_train_xgb_781, 
+  fitted_test_xgb_781
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+data_plot_xgb_781 <- data_plot_xgb_781 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_xgb_781 <- ggplot(data_plot_xgb_781, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(data_plot_xgb_781$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model XGBoost (Stesen: Sg. Serai Batu 12)",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+plot_xgb_781
+
+df_long <- data_plot_xgb_781 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_xgb_781 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi XGBoost: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: Sg. Serai Batu 12",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+sarimax_2021 <- plot_arimax_781 %>%
+  filter(format(date, "%Y") == "2021")
+sarimax_2021
+
+xgb_2021 <- data_plot_xgb_781 %>%
+  filter(format(date, "%Y") == "2021")
+xgb_2021
+
+# Balai Polis Batu 14
+
+xreg_train_matrix <- as.matrix(
+  train_821 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+xreg_test_matrix <- as.matrix(
+  test_821 %>%
+    dplyr::select(Avg_Temp, Avg_Humidity, Sum_Precip)
+)
+
+x_center_arima_821 <- colMeans(xreg_train_matrix)
+x_scale_arima_821  <- apply(xreg_train_matrix, 2, sd)
+
+x_scale_arima_821[x_scale_arima_821 == 0] <- 1
+
+xreg_train_sc_821 <- scale(
+  xreg_train_matrix,
+  center = x_center_arima_821,
+  scale  = x_scale_arima_821
+)
+
+xreg_test_sc_821 <- scale(
+  xreg_test_matrix,
+  center = x_center_arima_821,
+  scale  = x_scale_arima_821
+)
+
+acf_821 <- acf(train_821$hujan_sum, lag.max = 24, main = "ACF 0240821RF  BALAI POLIS BATU 14")
+pacf_821 <- pacf(train_821$hujan_sum, lag.max = 24, main = "PACF 0240821RF  BALAI POLIS BATU 14")
+acf_821 <- ggAcf(train_821$hujan_sum, lag.max = 24) +
+  ggtitle("ACF Stesen: Balai Polis Batu 14")+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+pacf_821 <- ggPacf(train_821$hujan_sum, lag.max = 24) +
+  ggtitle("PACF Stesen: Balai Polis Batu 14") +
+  theme_minimal(base_size = 13)+
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,      
+      face = "bold",    
+      size = 15         ))
+combined_acf_pacf_821 <- acf_821 / pacf_821
+
+y_train_arima_821 <- train_821$hujan_sum
+y_test_arima_821  <- test_821$hujan_sum
+y_train_arima_ts_821 <- ts(y_train_arima_821, frequency = 12)
+adf.test(y_train_arima_ts_821)
+
+model1_821 <- Arima(
+  y_train_arima_ts_821,
+  xreg = xreg_train_sc_821,
+  order = c(0,0,0),
+  seasonal = c(2,1,0)
+)
+summary(model1_821)
+checkresiduals(model1_821)
+
+h_arima_821 <- nrow(test_821)
+fc_arima_821 <- forecast(model1_821, h = h_arima_821, xreg = xreg_test_sc_821)
+fitted_train_arima_821 <- as.numeric(fitted(model1_821))
+y_train_arima_821      <- train_821$hujan_sum        
+
+y_arima_pred_test_821 <- as.numeric(fc_arima_821$mean)
+y_test_arima_821       <- test_821$hujan_sum    
+
+calc_metrics <- function(actual, predicted) {
+  ralat <- actual - predicted
+  MSE <- mean(ralat^2, na.rm = TRUE)
+  RMSE <- sqrt(MSE)
+  MAE  <- mean(abs(ralat), na.rm = TRUE)
+  percent_error <- abs(ralat / actual) * 100
+  percent_error[is.infinite(percent_error)] <- NA
+  MAPE <- mean(percent_error, na.rm = TRUE)
+  RSS <- sum(ralat^2, na.rm = TRUE)
+  TSS <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  R_squared <- 1 - (RSS / TSS)
+  data.frame(MSE, RMSE, MAE,MAPE, R_squared)
+}
+
+train_metrics_arima_821 <- calc_metrics(y_train_arima_821, fitted_train_arima_821)
+test_metrics_arima_821  <- calc_metrics(y_test_arima_821, y_arima_pred_test_821)
+
+bind_rows(
+  "Train ARIMAX" = train_metrics_arima_821,
+  "Test ARIMAX"  = test_metrics_arima_821,
+  .id = "Dataset" )
+
+PLOT_End <- as.Date("2024-12-01")
+PLOT_Start <- as.Date("2010-01-01")
+
+sebenar_arima_821 <- train_821 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_test_821 <- test_821 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_arima_821 <- tibble(
+  Tarikh = train_821$Tarikh,
+  value  = fitted_train_arima_821, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_arima_821 <- tibble(
+  Tarikh = test_821$Tarikh,
+  value  = y_arima_pred_test_821, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+plot_arimax_821 <- bind_rows(
+  sebenar_arima_821,
+  sebenar_test_821, 
+  fitted_train_arima_821, 
+  fitted_test_arima_821
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+plot_arimax_821 <- plot_arimax_821 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_sarimax_821 <- ggplot(plot_arimax_821, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(plot_arimax_821$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model SARIMAX (Stesen: Balai Polis Batu 14)",
+    subtitle = "SARIMAX (0,0,0)(2,1,0)[12]",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+    #panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.1)
+  )
+
+plot_sarimax_821
+
+df_long <- plot_arimax_821 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_sarimax_821 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi SARIMAX: Nilai Sebenar vs Nilai Ramalan",
+    subtitle = "Stesen: Balai Polis Batu 14",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text (hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+
+# Model XGBoost
+
+xgb_d821 <- bulan %>% filter (Stesen == "0240821RF  BALAI POLIS BATU 14" ) %>%
+  mutate(
+    lag_12 = lag(hujan_sum, n = 12)) %>%
+  arrange(Tarikh)
+View(xgb_d821)
+train_xgb_821 <- xgb_d821 %>% filter(Tarikh < TRAIN_END)
+test_xgb_821 <- xgb_d821 %>% filter(Tarikh >= TRAIN_END & Tarikh <= TEST_END)
+features_821 <- c("Avg_Temp", "Avg_Humidity", "Sum_Precip", "lag_12")
+target_821   <- "hujan_sum"
+
+# Tambah lajur Set untuk split balik
+all_821 <- bind_rows(
+  train_xgb_821 %>% mutate(Set = "Train"),
+  test_xgb_821  %>% mutate(Set = "Test")
+)
+
+dummy_xgb <- dummyVars(
+  formula = ~ Avg_Temp + Avg_Humidity + Sum_Precip + lag_12,
+  data    = all_821
+)
+
+all_xgb_mat <- predict(dummy_xgb, newdata = all_821) %>% as.matrix()
+
+train_idx <- all_821$Set == "Train"
+all_y <- all_821$hujan_sum
+
+x_train_xgb <- all_xgb_mat[train_idx, ]
+y_train_xgb <- all_y[train_idx]
+
+x_test_xgb <- all_xgb_mat[!train_idx, ]
+y_test_xgb <- all_y[!train_idx]
+
+dtrain_821 <- xgb.DMatrix(data = x_train_xgb, label = y_train_xgb)
+dtest_821  <- xgb.DMatrix(data = x_test_xgb,  label = y_test_xgb)
+
+params_821 <- list(
+  objective = "reg:squarederror", # regresi
+  eval_metric = "rmse",
+  eta = 0.05,                     # learning rate
+  max_depth = 3,
+  subsample = 0.7,
+  colsample_bytree = 0.7,
+  min_child_weight = 1
+)
+
+watchlist <- list(
+  train = dtrain_821,
+  eval  = dtest_821
+)
+
+set.seed(123)
+xgb_821 <- xgb.train(
+  params = params_821,
+  data = dtrain_821,
+  nrounds = 200,
+  watchlist = watchlist,
+  early_stopping_rounds = 20,
+  print_every_n = 50
+)
+
+feature_names <- colnames(x_train_xgb)
+importance_xgb_821 <- xgb.importance(
+  feature_names = feature_names,
+  model = xgb_821
+)
+
+print(importance_xgb_821)
+
+xgb.plot.importance(importance_xgb_821,
+                    main = "Kepentingan Pembolehubah dalam Model XGBoost (Stesen 0240821RF  BALAI POLIS BATU 14)",col = "steelblue")
+rename_vars <- c(
+  "Avg_Temp"     = "Suhu Purata",
+  "Avg_Humidity" = "Kelembapan Purata",
+  "Sum_Precip"   = "Jumlah Kerpasan",
+  "lag_12" = "Lag 12"
+)
+importance_xgb_821$Feature <- rename_vars[importance_xgb_821$Feature]
+
+
+imp_xgb_821 <- ggplot(importance_xgb_821, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +     
+  coord_flip() +
+  labs(
+    title = "Kepentingan Pemboleh Ubah (Stesen: Balai Polis Batu 14)",
+    x = "Pemboleh Ubah",
+    y = "Nilai Kepentingan Pemboleh Ubah"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12,
+                              margin = ggplot2::margin(t = 15, b = 5))
+  )
+
+ggsave("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\DRAFT 0711\\rajah\\imp_xgb_821.png", imp_xgb_821, width = 12, height = 8, dpi = 480)
+
+xgb_train_pred_821 <- predict(xgb_821, dtrain_821)
+xgb_test_pred_821  <- predict(xgb_821, dtest_821)
+
+train_metrics_xgb_821 <- calc_metrics(y_train_xgb, xgb_train_pred_821)
+test_metrics_xgb_821  <- calc_metrics(y_test_xgb,  xgb_test_pred_821)
+
+bind_rows(
+  "Train XGBoost" = train_metrics_xgb_821,
+  "Test XGBoost"  = test_metrics_xgb_821,
+  .id = "Dataset"
+)
+
+sebenar_xgb_821 <- train_xgb_821 %>%
+  filter(Tarikh >= PLOT_Start, Tarikh <= PLOT_End) %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+sebenar_xgbt_821 <- test_xgb_821 %>%
+  transmute(Tarikh, value = hujan_sum, Series = "Data Sebenar")
+
+fitted_train_xgb_821 <- tibble(
+  Tarikh = train_xgb_821$Tarikh,
+  value  = xgb_train_pred_821, 
+  Series = "Data Latihan (Ramalan)"
+)
+
+fitted_test_xgb_821 <- tibble(
+  Tarikh = test_xgb_821$Tarikh,
+  value  = xgb_test_pred_821, 
+  Series = "Data Ujian (Ramalan)"
+)
+
+data_plot_xgb_821 <- bind_rows(
+  sebenar_xgb_821,
+  sebenar_xgbt_821, 
+  fitted_train_xgb_821, 
+  fitted_test_xgb_821
+) %>%
+  mutate(Series = factor(Series, levels = c("Data Sebenar","Data Latihan (Ramalan)","Data Ujian (Ramalan)")))
+
+data_plot_xgb_821 <- data_plot_xgb_821 %>%
+  mutate(date = as.Date(Tarikh))
+
+plot_xgb_821 <- ggplot(data_plot_xgb_821, aes(x = date, y = value, color = Series)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c(
+    "Data Sebenar" = "black",
+    "Data Ujian (Ramalan)" = "#1F77B4",
+    "Data Latihan (Ramalan)"  = "#D62728"
+  )) +
+  geom_vline(xintercept = TRAIN_END,
+             linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  annotate("text", x = TRAIN_END + 100, y = max(data_plot_xgb_821$value, na.rm = TRUE) * 0.95,
+           label = "Sempadan Latihan–Ujian", color = "grey40", hjust = 0, size = 3) +
+  labs(
+    title = "Perbandingan Data Sebenar dan Nilai Ramalan Model XGBoost (Stesen: Balai Polis Batu 14)",
+    x = "Tahun",
+    y = "Jumlah Hujan Bulanan",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 13, color = "grey25"),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(color = "grey20"),
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+plot_xgb_821
+
+df_long <- data_plot_xgb_821 %>%
+  dplyr::select(date, value, Series)
+df_wide <- df_long %>%
+  pivot_wider(
+    names_from  = Series,
+    values_from = value
+  )
+df_all <- df_wide %>%
+  pivot_longer(
+    cols = c(`Data Latihan (Ramalan)`, `Data Ujian (Ramalan)`),
+    names_to  = "JenisRamalan",
+    values_to = "Predicted"
+  ) %>%
+  filter(!is.na(Predicted)) %>%
+  rename(Actual = `Data Sebenar`) %>%
+  mutate(
+    JenisRamalan = factor(
+      JenisRamalan,
+      levels = c("Data Latihan (Ramalan)", "Data Ujian (Ramalan)"),
+      labels = c("Data Latihan", "Data Ujian")
+    ))
+cor_all <- cor(df_all$Actual, df_all$Predicted, use = "complete.obs")
+
+x_pos <- min(df_all$Actual, na.rm = TRUE) + 0.05 * diff(range(df_all$Actual))
+y_pos <- max(df_all$Predicted, na.rm = TRUE) - 0.05 * diff(range(df_all$Predicted))
+
+r_xgb_821 <- ggplot(df_all, aes(x = Actual, y = Predicted, color = JenisRamalan)) +
+  geom_point(alpha = 1, size = 2) +
+  geom_smooth(
+    aes(linetype = "Garis Purata"),
+    method = "lm",
+    se = FALSE,
+    color = "black",
+    size = 1 ) +
+  scale_color_manual(
+    values = c("Data Latihan" = "#1F77B4", "Data Ujian" = "#D62728")) +
+  scale_linetype_manual(
+    name = "",
+    values = c("Garis Purata" = "dashed") ) +
+  labs(
+    title = "Plot Korelasi XGBoost: Nilai Sebenar vs Nilai Ramalan" ,
+    subtitle = "Stesen: Balai Polis Batu 14",
+    x = "Nilai Sebenar",
+    y = "Nilai Ramalan",
+    color = "Jenis Ramalan" ) +
+  annotate(
+    "text",
+    x = x_pos, y = y_pos,
+    label = paste0("Korelasi = ", round(cor_all, 3)),
+    hjust = 0, vjust = 1, size = 5 ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold",size = 14, margin = margin(t = 10, b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(color = "grey20"),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank())
+
+imp_xgb <- (imp_xgb_411 | imp_xgb_441) /
+  (imp_xgb_781 | imp_xgb_821)
+imp_xgb
+
+sarimax_semua <- (r_sarimax_411 | r_sarimax_441)/
+  (r_sarimax_781 | r_sarimax_821)
+sarimax_semua
+
+xgb_semua <- (r_xgb_411 | r_xgb_441)/
+  (r_xgb_781 | r_xgb_821)
+xgb_semua
+ggsave("C:\\Users\\AMIN\\Desktop\\SEM 7\\STQS4993 FYP II\\finalize\\DRAFT 0711\\rajah\\xgb_semua.png", xgb_semua, width = 16, height = 8, dpi = 480)
+
+sarimax_2021 <- plot_arimax_821 %>%
+  filter(format(date, "%Y") == "2021")
+sarimax_2021
+
+xgb_2021 <- data_plot_xgb_821 %>%
+  filter(format(date, "%Y") == "2021")
+xgb_2021
